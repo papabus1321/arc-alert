@@ -1,12 +1,8 @@
 """
-BTCUSDT 무기한 선물(Binance) 4시간봉 RSI 알림
+BTCUSDT 무기한 선물 4시간봉 RSI 알림 (시세: Hyperliquid/OKX/Coinbase/Kraken)
 - RSI(14) ≤ 25 로 들어가면 🟢 알림
 - RSI(14) ≥ 85 로 들어가면 🔴 알림
 - 구간에 머무는 동안은 다시 알리지 않고, 벗어났다가 다시 들어오면 알림
-
-환경변수: TG_BOT_TOKEN, TG_CHAT_ID (필수)
-  SYMBOL=BTCUSDT  INTERVAL=4h  RSI_LEN=14  RSI_LOW=25  RSI_HIGH=85
-  TEST_MODE=true 면 신호 없어도 현재 상태를 보냄
 """
 import json
 import os
@@ -23,6 +19,8 @@ RSI_LOW = float(os.getenv("RSI_LOW", "25"))
 RSI_HIGH = float(os.getenv("RSI_HIGH", "85"))
 TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
 KST = timezone(timedelta(hours=9))
+SEC = {"1h": 3600, "4h": 14400, "1d": 86400}[INTERVAL]
+COIN = SYMBOL.replace("USDT", "").replace("USD", "")
 
 
 def http(url, data=None, headers=None):
@@ -31,30 +29,44 @@ def http(url, data=None, headers=None):
         return json.loads(r.read().decode())
 
 
-# ---------- 시세: Binance 선물 우선, 막히면 Bybit 선물 ----------
-def candles_binance():
-    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={SYMBOL}&interval={INTERVAL}&limit=300"
-    return [(int(k[0]), float(k[4])) for k in http(url)]
+def candles_hyperliquid():
+    end = int(time.time() * 1000)
+    body = json.dumps({"type": "candleSnapshot", "req": {
+        "coin": COIN, "interval": INTERVAL, "startTime": end - SEC * 1000 * 300, "endTime": end}}).encode()
+    data = http("https://api.hyperliquid.xyz/info", body,
+                {"Content-Type": "application/json", "User-Agent": "rsi-alert"})
+    return sorted((int(c["t"]), float(c["c"])) for c in data)
 
 
-def candles_bybit():
-    iv = {"1h": "60", "4h": "240", "1d": "D"}[INTERVAL]
-    url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={SYMBOL}&interval={iv}&limit=300"
-    return sorted((int(x[0]), float(x[4])) for x in http(url)["result"]["list"])
+def candles_okx():
+    bar = {"1h": "1H", "4h": "4H", "1d": "1D"}[INTERVAL]
+    url = f"https://www.okx.com/api/v5/market/candles?instId={COIN}-USDT-SWAP&bar={bar}&limit=300"
+    return sorted((int(x[0]), float(x[4])) for x in http(url)["data"])
+
+
+def candles_coinbase():
+    url = f"https://api.exchange.coinbase.com/products/{COIN}-USD/candles?granularity={SEC}"
+    return sorted((int(x[0]) * 1000, float(x[4])) for x in http(url))
+
+
+def candles_kraken():
+    pair = "XBTUSD" if COIN == "BTC" else f"{COIN}USD"
+    data = http(f"https://api.kraken.com/0/public/OHLC?pair={pair}&interval={SEC // 60}")
+    rows = next(v for k, v in data["result"].items() if k != "last")
+    return sorted((int(x[0]) * 1000, float(x[4])) for x in rows)
 
 
 def get_candles():
-    for fn in (candles_binance, candles_bybit):
+    for fn in (candles_hyperliquid, candles_okx, candles_coinbase, candles_kraken):
         try:
             c = fn()
             if len(c) > RSI_LEN + 5:
                 return c, fn.__name__.replace("candles_", "")
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             print(f"{fn.__name__} 실패: {e}")
     raise RuntimeError("시세를 가져오지 못했습니다")
 
 
-# ---------- RSI (Wilder) ----------
 def rsi(closes, n):
     g, l = [], []
     for i in range(1, len(closes)):
@@ -76,7 +88,7 @@ def send(text):
 
 def main():
     candles, source = get_candles()
-    closed = candles[:-1]  # 진행 중인 봉 제외
+    closed = candles[:-1]
     closes = [c[1] for c in closed]
     r = rsi(closes, RSI_LEN)
     prev, cur = r[-2], r[-1]
